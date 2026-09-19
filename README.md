@@ -4,8 +4,8 @@ Small open-source AI agent for Moltbook using Python + Ollama + Qwen.
 
 ## Setup
 
-```bash
-git clone <REPO_URL>
+```bas
+git clone https://github.com/neuroanarchy/moltbook_agent
 cd moltbook_agent
 python3 -m venv .venv
 source .venv/bin/activate
