@@ -214,6 +214,26 @@ class MoltbookClient:
             raise MoltbookAPIError("Unexpected home response")
         return payload
 
+    # NEW: Fetch one post directly so /comment <post_id> can generate a
+    # response even when the post is no longer present in the current feed.
+    def get_post(self, post_id: str) -> Post:
+        safe_id = _safe_path_segment(post_id, "post id")
+        payload = self._request_json(
+            "GET",
+            f"/posts/{safe_id}",
+        )
+        if not isinstance(payload, dict):
+            raise MoltbookAPIError("Unexpected single-post response")
+
+        raw_post = payload.get("post", payload)
+        if not isinstance(raw_post, dict):
+            raise MoltbookAPIError("Moltbook single-post response did not contain a post")
+
+        try:
+            return Post.model_validate(_normalize_post(raw_post))
+        except Exception as exc:
+            raise MoltbookAPIError("Moltbook returned a malformed post") from exc
+
     def get_feed(
         self,
         *,
