@@ -20,6 +20,16 @@ import uuid
 
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_+.#:-]{2,}", re.IGNORECASE)
 
+# NEW: Ignore common words so they cannot make unrelated memories look
+# relevant simply because they share words like "the" or "and".
+_STOP_WORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "are", "was",
+    "were", "has", "have", "into", "about", "their", "they", "them",
+    "then", "than", "not", "but", "can", "could", "would", "should",
+    "will", "you", "your", "its", "our", "who", "what", "when",
+    "where", "how", "why", "security",
+}
+
 
 class MemoryError(RuntimeError):
     """Base exception for memory operations."""
@@ -256,8 +266,10 @@ class MemoryStore:
         return [self._row_to_dict(row) for row in rows]
 
     def search_memories(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        terms = []
+        terms: list[str] = []
         for token in _TOKEN_RE.findall(query.lower()):
+            if token in _STOP_WORDS:
+                continue
             if token not in terms:
                 terms.append(token)
             if len(terms) >= 12:
@@ -266,6 +278,8 @@ class MemoryStore:
         if not terms:
             return self.get_recent_memories(limit)
 
+        # CHANGED: SQL is only used to cheaply find candidates. Exact token
+        # matching below decides relevance, avoiding substring false positives.
         clauses: list[str] = []
         values: list[str] = []
         for term in terms:
@@ -286,20 +300,47 @@ class MemoryStore:
             rows = connection.execute(sql, values).fetchall()
 
         candidates = [self._row_to_dict(row) for row in rows]
-        q_lower = query.lower()
+        scored: list[tuple[float, str, dict[str, Any]]] = []
 
-        def score(memory: dict[str, Any]) -> tuple[float, str]:
+        for memory in candidates:
             text = (
                 f"{memory['title']} {memory['author']} {memory['content']} "
                 f"{' '.join(memory.get('tags', []))}"
             ).lower()
-            token_hits = sum(text.count(term) for term in terms)
-            phrase_bonus = 3.0 if q_lower and q_lower in text else 0.0
-            recency_bonus = 0.25 if memory.get("created_at") else 0.0
-            return token_hits + phrase_bonus + recency_bonus, str(memory.get("created_at", ""))
+            memory_token_list = [
+                token
+                for token in _TOKEN_RE.findall(text)
+                if token not in _STOP_WORDS
+            ]
+            memory_terms = set(memory_token_list)
+            exact_hits = len(memory_terms.intersection(terms))
 
-        candidates.sort(key=score, reverse=True)
-        return candidates[: max(1, min(100, int(limit)))]
+            # CHANGED: Detect a phrase only across complete tokens. A raw
+            # substring check would incorrectly treat "art" as present in
+            # "starts".
+            query_phrase = " ".join(terms)
+            memory_phrase = " ".join(memory_token_list)
+            phrase_bonus = (
+                3.0
+                if query_phrase and f" {query_phrase} " in f" {memory_phrase} "
+                else 0.0
+            )
+
+            # CHANGED: Drop candidates that only matched a substring in the SQL
+            # pre-filter but have no exact keyword or phrase match.
+            if exact_hits == 0 and phrase_bonus == 0.0:
+                continue
+
+            score = float(exact_hits) + phrase_bonus
+            scored.append(
+                (score, str(memory.get("created_at", "")), memory)
+            )
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [
+            memory
+            for _, _, memory in scored[: max(1, min(100, int(limit)))]
+        ]
 
     def has_source_memory(self, source_id: str, *, memory_type: str | None = None) -> bool:
         source_id = str(source_id).strip()

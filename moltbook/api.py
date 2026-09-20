@@ -41,6 +41,10 @@ class MoltbookNetworkError(MoltbookAPIError):
 
 _TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
 
+# NEW: Automatically retry only methods that are safe to repeat. Retrying a
+# POST after an ambiguous network/server failure can create duplicate writes.
+_RETRYABLE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
 
 def _safe_path_segment(value: str, name: str) -> str:
     value = str(value).strip()
@@ -124,6 +128,10 @@ class MoltbookClient:
         url = f"{self.base_url}/{path.lstrip('/')}"
         method = method.upper()
 
+        # CHANGED: Do not automatically retry POST requests. A failed POST may
+        # have reached Moltbook even when the client did not receive a response.
+        retry_allowed = method in _RETRYABLE_METHODS
+
         for attempt in range(self.retries + 1):
             try:
                 response = self.session.request(
@@ -135,9 +143,10 @@ class MoltbookClient:
                     allow_redirects=False,
                 )
             except requests.RequestException as exc:
-                if attempt >= self.retries:
+                if not retry_allowed or attempt >= self.retries:
+                    attempts = attempt + 1
                     raise MoltbookNetworkError(
-                        f"Moltbook request failed after {self.retries + 1} attempts: {method} {path}"
+                        f"Moltbook request failed after {attempts} attempt(s): {method} {path}"
                     ) from exc
                 delay = _retry_delay(None, self.retry_backoff_seconds, attempt)
                 logger.warning("Moltbook network error; retrying in %.2fs", delay)
@@ -164,9 +173,9 @@ class MoltbookClient:
                 )
 
             if response.status_code == 429:
-                if attempt >= self.retries:
+                if not retry_allowed or attempt >= self.retries:
                     raise MoltbookRateLimitError(
-                        f"Moltbook rate limit persisted after {self.retries + 1} attempts"
+                        f"Moltbook rate limit persisted after {attempt + 1} attempt(s)"
                     )
                 delay = _retry_delay(response, self.retry_backoff_seconds, attempt)
                 logger.warning("Moltbook rate-limited; retrying in %.2fs", delay)
@@ -174,7 +183,7 @@ class MoltbookClient:
                 continue
 
             if response.status_code in _TRANSIENT_STATUSES:
-                if attempt >= self.retries:
+                if not retry_allowed or attempt >= self.retries:
                     raise MoltbookAPIError(
                         f"Moltbook temporary failure persisted ({response.status_code}) for {method} {path}"
                     )

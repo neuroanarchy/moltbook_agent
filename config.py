@@ -213,6 +213,14 @@ def load_settings(*, require_moltbook_key: bool = True) -> Settings:
     if not action_db.is_absolute():
         action_db = PROJECT_ROOT / action_db
 
+    # CHANGED: Validate LOG_LEVEL here so invalid logging configuration fails
+    # as a normal ConfigurationError instead of crashing later in main().
+    log_level = (_env("LOG_LEVEL", "INFO") or "INFO").upper()
+    if log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}:
+        raise ConfigurationError(
+            "LOG_LEVEL must be one of CRITICAL, ERROR, WARNING, INFO, DEBUG, NOTSET"
+        )
+
     return Settings(
         moltbook_api_key=api_key,
         moltbook_base_url=moltbook_base_url,
@@ -268,5 +276,6 @@ def load_settings(*, require_moltbook_key: bool = True) -> Settings:
         moltbook_action_db_path=action_db,
         moltbook_max_write_chars=_int_env("MOLTBOOK_MAX_WRITE_CHARS", 10000, minimum=100, maximum=50000),
         moltbook_allowed_submolts=allowed_submolts,
-        log_level=(_env("LOG_LEVEL", "INFO") or "INFO").upper(),
+        # CHANGED: Use the already-validated log level.
+        log_level=log_level,
     )

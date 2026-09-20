@@ -316,16 +316,37 @@ Return ONLY one JSON object matching the requested schema.
             "content": content,
         })
 
-    def post_to_moltbook(self, *, submolt: str, title: str, content: str) -> dict[str, Any]:
-        """Explicit Python-controlled post action; never callable by the LLM directly."""
+    def post_to_moltbook(
+        self,
+        *,
+        submolt: str,
+        title: str,
+        content: str,
+        approved: bool = False,
+    ) -> dict[str, Any]:
+        # CHANGED: Approval must be supplied by the Python caller instead of
+        # being hard-coded to True inside this wrapper.
         return self.action_layer.create_post(
-            submolt=submolt, title=title, content=content, approved=True
+            submolt=submolt,
+            title=title,
+            content=content,
+            approved=approved,
         )
 
-    def comment_on_moltbook(self, *, post_id: str, content: str, parent_id: str | None = None) -> dict[str, Any]:
-        """Explicit Python-controlled comment/reply action."""
+    def comment_on_moltbook(
+        self,
+        *,
+        post_id: str,
+        content: str,
+        parent_id: str | None = None,
+        approved: bool = False,
+    ) -> dict[str, Any]:
+        # CHANGED: Comments/replies use the same explicit approval boundary.
         return self.action_layer.create_comment(
-            post_id=post_id, content=content, parent_id=parent_id, approved=True
+            post_id=post_id,
+            content=content,
+            parent_id=parent_id,
+            approved=approved,
         )
 
     def write_status(self) -> str:
@@ -357,11 +378,9 @@ Return ONLY one JSON object matching the requested schema.
             {"role": "user", "content": task},
         ]
 
-    def relevant_memories_text(self, query: str) -> str:
-        memories = self.memory.search_memories(
-            query,
-            limit=self.settings.relevant_memory_limit,
-        )
+    def _render_memory_context(self, memories: list[dict[str, Any]]) -> str:
+        # NEW: Keep memory formatting in one place so every retrieval path uses
+        # the same bounded, untrusted-data representation.
         if not memories:
             return "No relevant memories found."
 
@@ -387,6 +406,51 @@ Return ONLY one JSON object matching the requested schema.
             rendered.append(block)
             total += len(block) + 2
         return _cap_text("\n\n".join(rendered), limit)
+
+    def relevant_memories_text(self, query: str) -> str:
+        memories = self.memory.search_memories(
+            query,
+            limit=self.settings.relevant_memory_limit,
+        )
+        return self._render_memory_context(memories)
+
+    def relevant_memories_for_posts_text(self, posts: list[Post]) -> str:
+        # NEW: Search each candidate rather than only the first five posts. The
+        # old approach could completely miss a memory relevant to candidate 6+.
+        scored: dict[str, tuple[int, dict[str, Any]]] = {}
+        per_query_limit = self.settings.relevant_memory_limit
+
+        for post in posts:
+            query = (
+                f"{post.title} "
+                f"{post.content[: self.settings.max_post_preview_chars]}"
+            )
+            memories = self.memory.search_memories(
+                query,
+                limit=per_query_limit,
+            )
+
+            for rank, memory in enumerate(memories):
+                memory_id = str(memory.get("id") or "")
+                if not memory_id:
+                    continue
+                contribution = per_query_limit - rank
+                previous = scored.get(memory_id)
+                if previous is None:
+                    scored[memory_id] = (contribution, memory)
+                else:
+                    scored[memory_id] = (previous[0] + contribution, previous[1])
+
+        ranked_memories = [
+            memory
+            for _, memory in sorted(
+                scored.values(),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+        ][: self.settings.relevant_memory_limit]
+
+        return self._render_memory_context(ranked_memories)
 
     def recent_memories_text(self) -> str:
         memories = self.memory.get_recent_memories(self.settings.recent_memory_limit)
@@ -436,10 +500,9 @@ Return ONLY one JSON object matching the requested schema.
                 }
             )
 
-        context_query = "\n".join(
-            f"{item['title']} {item['preview']}" for item in post_summaries[:5]
-        )
-        memory_text = self.relevant_memories_text(context_query)
+        # CHANGED: Retrieve memory against every candidate instead of only the
+        # first five candidate posts.
+        memory_text = self.relevant_memories_for_posts_text(candidates)
 
         task = f"""
 Select exactly one candidate post for deeper cybersecurity investigation.
@@ -802,7 +865,10 @@ Do not claim external verification you did not perform.
                             print("Post discarded. Nothing was published.")
                             continue
                         response = self.post_to_moltbook(
-                            submolt=draft.submolt, title=draft.title, content=draft.content
+                            submolt=draft.submolt,
+                            title=draft.title,
+                            content=draft.content,
+                            approved=True,
                         )
                         print("Published successfully.")
                         print(json.dumps(_redact_for_display(response), indent=2, ensure_ascii=False))
@@ -814,13 +880,32 @@ Do not claim external verification you did not perform.
                     parts = [part.strip() for part in argument.split("|")]
                     try:
                         if command == "/comment" and len(parts) == 2:
-                            response = self.comment_on_moltbook(post_id=parts[0], content=parts[1])
+                            post_id, content = parts
+                            parent_id = None
                         elif command == "/reply" and len(parts) == 3:
-                            response = self.comment_on_moltbook(post_id=parts[0], parent_id=parts[1], content=parts[2])
+                            post_id, parent_id, content = parts
                         else:
                             print("Usage: /comment <post_id> | <content>")
                             print("       /reply <post_id> | <parent_id> | <content>")
                             continue
+
+                        approved = True
+                        if (
+                            self.action_layer.policy.require_approval
+                            and not self.action_layer.policy.dry_run
+                        ):
+                            approval = input("Publish this comment/reply? [y/N]: ").strip().lower()
+                            approved = approval in {"y", "yes"}
+                            if not approved:
+                                print("Comment discarded. Nothing was published.")
+                                continue
+
+                        response = self.comment_on_moltbook(
+                            post_id=post_id,
+                            parent_id=parent_id,
+                            content=content,
+                            approved=approved,
+                        )
                         print("Published successfully.")
                         print(json.dumps(_redact_for_display(response), indent=2, ensure_ascii=False))
                     except ActionPolicyError as exc:
